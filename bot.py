@@ -4,7 +4,6 @@ from discord.ext import commands, tasks
 from discord import app_commands
 from twitchAPI.twitch import Twitch
 import asyncio
-import json
 import mysql.connector
 
 # Define your variables here
@@ -42,26 +41,31 @@ conn = mysql.connector.connect(
 )
 c = conn.cursor()
 c.execute('''CREATE TABLE IF NOT EXISTS streamer_channels
-             (streamer_name VARCHAR(255), channel_id VARCHAR(255))''')
+             (streamer_name VARCHAR(255), channel_id VARCHAR(255), role_id VARCHAR(255))''')
 conn.commit()
 
-def save_streamer_data(streamer_name, channel_id):
-    c.execute("INSERT INTO streamer_channels (streamer_name, channel_id) VALUES (%s, %s)", (streamer_name, channel_id))
+def save_streamer_data(streamer_name, channel_id, role_id):
+    c.execute("INSERT INTO streamer_channels (streamer_name, channel_id, role_id) VALUES (%s, %s, %s)", (streamer_name, channel_id, role_id))
     conn.commit()
 
-def remove_streamer_data(streamer_name, channel_id):
-    c.execute("DELETE FROM streamer_channels WHERE streamer_name = %s AND channel_id = %s", (streamer_name, channel_id))
+def remove_streamer_data(streamer_name, guild_id):
+    c.execute("DELETE FROM streamer_channels WHERE streamer_name = %s AND guild_id = %s", (streamer_name, guild_id))
     conn.commit()
 
 def load_streamer_data():
-    c.execute("SELECT * FROM streamer_channels")
+    c.execute("SELECT streamer_name, channel_id, role_id FROM streamer_channels")
     return c.fetchall()
+
+# Dictionary to keep track of live stream messages per channel and streamer
+live_stream_messages = {}
+live_status = {}
 
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}')
     await twitch.authenticate_app([])
     check_streamers.start()
+    check_channel_access.start()
 
 @bot.command()
 @commands.is_owner()
@@ -71,26 +75,31 @@ async def sync(ctx: commands.Context) -> None:
     await ctx.send(f"Synced {len(synced)} commands globally")
 
 @tree.command(name="add_streamer", description="Add a streamer to the notification list")
-async def add_streamer(interaction: discord.Interaction, streamer_name: str, channel_id: str):
+async def add_streamer(interaction: discord.Interaction, streamer_name: str, channel_id: str = None, role_id: str = None):
     if interaction.user.guild_permissions.administrator:
-        existing_entries = c.execute("SELECT * FROM streamer_channels WHERE streamer_name = %s AND channel_id = %s", (streamer_name, channel_id)).fetchall()
-        if not existing_entries:
-            save_streamer_data(streamer_name, channel_id)
-            await interaction.response.send_message(f'Added {streamer_name} to notifications in channel {channel_id}')
+        if channel_id is None:
+            channel_id = str(interaction.channel_id)
+        channel = bot.get_channel(int(channel_id))
+        if channel and channel.guild.id == interaction.guild_id:
+            c.execute("SELECT * FROM streamer_channels WHERE streamer_name = %s AND channel_id = %s", (streamer_name, channel_id))
+            existing_entries = c.fetchall()
+            if not existing_entries:
+                save_streamer_data(streamer_name, channel_id, role_id)
+                await interaction.response.send_message(f'Added {streamer_name} to notifications in channel <#{channel_id}>', ephemeral=True)
+            else:
+                await interaction.response.send_message(f'{streamer_name} is already being checked for notifications in channel <#{channel_id}>', ephemeral=True)
         else:
-            await interaction.response.send_message(f'{streamer_name} is already being checked for notifications in channel {channel_id}')
+            await interaction.response.send_message("The specified channel is not in this guild.", ephemeral=True)
     else:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
 
 @tree.command(name="remove_streamer", description="Remove a streamer from the notification list")
-async def remove_streamer(interaction: discord.Interaction, streamer_name: str, channel_id: str):
+async def remove_streamer(interaction: discord.Interaction, streamer_name: str):
     if interaction.user.guild_permissions.administrator:
-        existing_entries = c.execute("SELECT * FROM streamer_channels WHERE streamer_name = %s AND channel_id = %s", (streamer_name, channel_id)).fetchall()
-        if existing_entries:
-            remove_streamer_data(streamer_name, channel_id)
-            await interaction.response.send_message(f'Removed {streamer_name} from notifications in channel {channel_id}')
-        else:
-            await interaction.response.send_message(f'{streamer_name} is not in the notification list for channel {channel_id}')
+        guild_id = str(interaction.guild_id)
+        c.execute("DELETE FROM streamer_channels WHERE streamer_name = %s AND guild_id = %s", (streamer_name, guild_id))
+        conn.commit()
+        await interaction.response.send_message(f'Removed {streamer_name} from notifications in all channels of this guild.', ephemeral=True)
     else:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
 
@@ -101,37 +110,70 @@ async def list_streamers(interaction: discord.Interaction):
         response = "Streamers being checked for notifications in this guild:\n"
         found = False
         for entry in load_streamer_data():
-            streamer_name, channel_id = entry
+            streamer_name, channel_id, role_id = entry
             channel = bot.get_channel(int(channel_id))
             if channel and channel.guild.id == guild_id:
-                response += f"- {streamer_name} in channel <#{channel_id}>\n"
+                role_mention = f'<@&{role_id}>' if role_id else 'No role assigned'
+                response += f"- {streamer_name} in channel <#{channel_id}> (Role: {role_mention})\n"
                 found = True
         if not found:
             response = "No streamers are currently being checked for notifications in this guild."
-        await interaction.response.send_message(response)
+        await interaction.response.send_message(response, ephemeral=True)
     else:
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
 
 @tasks.loop(minutes=1)
 async def check_streamers():
     for entry in load_streamer_data():
-        streamer, channel_id = entry
-        user_info = twitch.get_users(logins=[streamer])
-        async for user in user_info:
-            user_id = user.id
-            stream_info = twitch.get_streams(user_id=user_id)
-            async for stream in stream_info:
-                channel = bot.get_channel(int(channel_id))
-                embed = discord.Embed(
-                    title=f'{streamer} is now live!',
-                    description=stream.title,
-                    color=discord.Color.blue()
-                )
-                embed.set_thumbnail(url=user.profile_image_url)
-                message = await channel.send(embed=embed)
-                await asyncio.sleep(60)  # Check every minute
-                while await twitch.get_streams(user_id=user_id):
-                    await asyncio.sleep(60)
-                await message.delete()
+        streamer, channel_id, role_id = entry
+        channel = bot.get_channel(int(channel_id))
+        if channel:
+            try:
+                user_info = twitch.get_users(logins=[streamer])
+                async for user in user_info:
+                    user_id = user.id
+                    stream_info = twitch.get_streams(user_id=user_id)
+                    async for stream in stream_info:
+                        tags = ', '.join([tag['tag_name'] for tag in stream.tag_ids]) if stream.tag_ids else 'No tags'
+                        thumbnail_url = stream.thumbnail_url.replace("{width}", "1280").replace("{height}", "720")
+                        embed = discord.Embed(
+                            title=stream.title,
+                            description=tags,
+                            color=discord.Color.green()
+                        )
+                        embed.set_thumbnail(url=user.profile_image_url)
+                        embed.add_field(name="Game", value=stream.game_name, inline=True)
+                        embed.add_field(name="Viewers", value=stream.viewer_count, inline=True)
+                        embed.set_image(url=thumbnail_url)
+                        embed.url = f'https://www.twitch.tv/{streamer}'
+                        role_mention = f'<@&{role_id}>' if role_id else ''
+                        message_content = f'{streamer} is now live! {role_mention}'
+                        if (streamer, channel_id) not in live_status or not live_status[(streamer, channel_id)]:
+                            message = await channel.send(content=message_content, embed=embed)
+                            live_stream_messages[(streamer, channel_id)] = message.id
+                            live_status[(streamer, channel_id)] = True
+                        else:
+                            message = await channel.fetch_message(live_stream_messages[(streamer, channel_id)])
+                            await message.edit(content=message_content, embed=embed)
+                    if (streamer, channel_id) in live_status and live_status[(streamer, channel_id)]:
+                        stream_info = twitch.get_streams(user_id=user_id)
+                        async for _ in stream_info:
+                            break
+                        else:
+                            message = await channel.fetch_message(live_stream_messages[(streamer, channel_id)])
+                            await message.delete()
+                            del live_stream_messages[(streamer, channel_id)]
+                            live_status[(streamer, channel_id)] = False
+            except discord.errors.Forbidden:
+                print(f"Missing access to send messages in channel {channel_id}")
+
+@tasks.loop(hours=24)
+async def check_channel_access():
+    for entry in load_streamer_data():
+        streamer_name, channel_id, role_id = entry
+        channel = bot.get_channel(int(channel_id))
+        if not channel:
+            remove_streamer_data(streamer_name, channel_id)
+            print(f"Removed {streamer_name} from channel {channel_id} due to missing access")
 
 bot.run(DISCORD_BOT_TOKEN)
