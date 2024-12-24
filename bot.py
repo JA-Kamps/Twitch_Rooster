@@ -94,10 +94,12 @@ async def add_streamer(interaction: discord.Interaction, streamer_name: str, cha
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
 
 @tree.command(name="remove_streamer", description="Remove a streamer from the notification list")
-async def remove_streamer(interaction: discord.Interaction, streamer_name: str):
+async def remove_streamer(interaction: discord.Interaction, streamer_name: str, channel_id: str = None):
+    if channel_id is None:
+            channel_id = str(interaction.channel_id)
     if interaction.user.guild_permissions.administrator:
         guild_id = str(interaction.guild_id)
-        c.execute("DELETE FROM streamer_channels WHERE streamer_name = %s AND guild_id = %s", (streamer_name, guild_id))
+        c.execute("DELETE FROM streamer_channels WHERE streamer_name = %s AND channel_id = %s", (streamer_name, channel_id))
         conn.commit()
         await interaction.response.send_message(f'Removed {streamer_name} from notifications in all channels of this guild.', ephemeral=True)
     else:
@@ -134,11 +136,11 @@ async def check_streamers():
                     user_id = user.id
                     stream_info = twitch.get_streams(user_id=user_id)
                     async for stream in stream_info:
-                        tags = ', '.join([tag['tag_name'] for tag in stream.tag_ids]) if stream.tag_ids else 'No tags'
                         thumbnail_url = stream.thumbnail_url.replace("{width}", "1280").replace("{height}", "720")
+                        #tags = ', '.join(stream.tags)
                         embed = discord.Embed(
                             title=stream.title,
-                            description=tags,
+                            #description=tags,
                             color=discord.Color.green()
                         )
                         embed.set_thumbnail(url=user.profile_image_url)
